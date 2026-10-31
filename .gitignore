@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.tgz
+.env
+# The local files a run in this folder would write.
+.agentx-calls.jsonl
+.agentx-novelty.json
+.agentx/
