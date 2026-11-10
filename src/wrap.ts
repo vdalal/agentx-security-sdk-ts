@@ -378,10 +378,67 @@ function record(name: string, args: unknown, description: string | undefined, op
 }
 
 /**
+ * A plain function has no `execute`, so returning it untouched leaves a tool that looks wrapped and
+ * is not: run from JavaScript with a key, `rm -rf /` ran and the gateway heard nothing. TypeScript's
+ * compiler already refuses it; this is for code that compiler never sees. It throws when the tool is
+ * wrapped, on the developer's first run, and no tool call is ever at stake. Only a function: a null
+ * entry, a client-side tool and any other object still come back untouched.
+ */
+export function refusePlainFunction(tool: unknown, wrapper: string, name?: string): void {
+  if (typeof tool !== "function" || typeof (tool as { execute?: unknown }).execute === "function") return;
+  const shown = name || tool.name;
+  throw new TypeError(
+    `${wrapper}: ${shown ? `'${shown}' is` : "this is"} a plain function, so it cannot be wrapped and nothing ` +
+      `would check it. Pass an object with an execute function: { execute: ${shown || "yourFunction"} }, or a ` +
+      "Vercel AI SDK tool().",
+  );
+}
+
+const warnedNotWrapped = new Set<string>();
+
+function hasOtherFunction(tool: object): boolean {
+  for (let o: object | null = tool; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+    for (const key of Object.getOwnPropertyNames(o)) {
+      if (key === "constructor") continue;
+      const about = Object.getOwnPropertyDescriptor(o, key);
+      if (about && typeof about.value === "function") return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * An object with no `execute` comes back untouched, and a Vercel AI SDK tool the client or the
+ * provider runs has to. `inputSchema` marks one and it stays silent: the schema itself can be a
+ * function there, so the functions on it say nothing. Any other object with a function on it
+ * (`{ run }`, a LangChain.js tool's `invoke`) looks wrapped and is not, so it says so, once per name;
+ * tools with no name are not the same tool, so each says so. A warning and not a throw: an error
+ * could stop a valid tool, and this never touches a call. Never raises.
+ */
+export function warnIfNotWrapped(tool: unknown, wrapper: string, name?: string): void {
+  try {
+    if (!tool || typeof tool !== "object" || typeof (tool as { execute?: unknown }).execute === "function") return;
+    if ("inputSchema" in tool || !hasOtherFunction(tool)) return;
+    const own = (tool as { name?: unknown }).name;
+    const shown = name || (typeof own === "string" && own) || "";
+    if (shown && warnedNotWrapped.has(shown)) return;
+    if (shown) warnedNotWrapped.add(shown);
+    console.error(
+      `[AgentX] ${wrapper}: '${shown || "(unnamed)"}' has no execute function, so it was not wrapped and nothing checks or ` +
+        "records its calls. Pass an object with an execute function, or a Vercel AI SDK tool().",
+    );
+  } catch {
+    /* an object that cannot be read is never a tool problem */
+  }
+}
+
+/**
  * Wrap one tool. Returns a new object with the same shape; the original is not mutated.
  */
 export function agentxWatch<T extends WatchableTool>(tool: T, opts: WatchOptions = {}): T {
-  // Anything without an `execute` function comes back untouched: a null or undefined entry
+  refusePlainFunction(tool, "agentxWatch", opts.name);
+  warnIfNotWrapped(tool, "agentxWatch", opts.name);
+  // Anything else without an `execute` function comes back untouched: a null or undefined entry
   // in a tools map, a Vercel AI SDK client-side tool, an untyped caller's object. Manufacturing
   // an `execute` for it would make the SDK run the tool server-side and throw inside this
   // wrapper.

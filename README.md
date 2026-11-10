@@ -20,6 +20,12 @@ const result = await generateText({
 });
 ```
 
+A tool is an object with an `execute` function, such as a Vercel AI SDK `tool()`. A plain function
+cannot be wrapped: from JavaScript, wrapping one throws an error that shows the shape to pass, and in
+TypeScript it does not compile. From JavaScript, an object with no `execute` but some other function,
+such as a LangChain.js tool, comes back unwrapped and prints a warning. One with an `inputSchema`
+counts as a client-side or provider tool: it comes back unwrapped and prints nothing.
+
 Then, from the folder your agent ran in:
 
 ```bash
@@ -174,7 +180,7 @@ const tools = agentxProtectAll({ runSql, sendEmail }, { agentId: "billing-bot" }
 ```
 
 ```bash
-AGENTX_API_KEY=agentx_sk_...                 # with no key, agentxProtect only records, like agentxWatch
+AGENTX_API_KEY=agentx_sk_...                 # with no key, agentxProtect only records, like agentxWatch (its verify still runs)
 AGENTX_GATEWAY_URL=https://your-gateway      # default http://localhost:8000; also read from ./.env
 ```
 
@@ -225,6 +231,8 @@ your provider's own total, which on a reasoning model includes the thinking toke
 Without it, each call sends an estimate from its own length, which never sees your prompt,
 history or thinking, so it undercounts on every model. Agents that share one budget set the same
 `AGENTX_BUDGET_POOL_ID` (or `budgetPoolId` on the tool).
+`AGENTX_ENVIRONMENT` (such as `prod` or `dev`) says where the agent runs, for a team rule with a
+limit per environment.
 
 **On a server, wrap each request or conversation in `agentxSession`.** The gateway's loop and
 repeat checks look at one run at a time, and TypeScript cannot tell on its own where one user's
@@ -269,6 +277,56 @@ Different from the Python SDK, on purpose: a wrapped `execute` becomes async (as
 gateway is a network call; the Vercel AI SDK awaits either); a stopped call is returned to the
 model rather than thrown, since a tool's return type does not exist at run time; and there are
 no checks in this package, so with the gateway down only `AGENTX_FAIL_MODE` decides.
+
+## Check that a write really happened
+
+Your agent moves a contact to "customer" in your CRM. The API answers `ok`, nothing changed, and
+the agent tells the sales team it's done. `verify` reads the record back after the tool has run:
+
+```ts
+const updateContact = agentxProtect(updateContactTool, {
+  name: "update_contact",
+  verify: async (args, result) => (await crm.get(args.contactId)).stage === args.stage,
+});
+```
+
+Return `true` when the change is there. Anything else counts as not confirmed. `args` is the call's
+arguments by name, and `result` is what the tool returned.
+
+When the tool returns an id, check by the id:
+
+```ts
+const issueRefund = agentxProtect(issueRefundTool, {
+  name: "issue_refund",
+  verify: async (args, result) => ["pending", "succeeded"].includes((await stripe.refunds.retrieve(result.id)).status),
+});
+```
+
+When it isn't confirmed, the agent gets this instead of the tool's result, and you get a line on
+stderr:
+
+> ⚠️ [AgentX Unconfirmed] 'update_contact' ran, but reading it back did not show the change. Do not report this as done. Do not repeat the call until you have checked the current state. Tell the user it is unconfirmed.
+
+`isUnconfirmed(result)` tells your code. `audit` counts these by tool.
+
+It needs no key. It also works while you're watching, so it's the one option that changes what a
+watched call returns. It goes on `agentxProtect` for one tool, not on `agentxProtectAll` (which
+refuses it) or `agentxWatch`.
+
+When your own code calls it, not a model, check `isUnconfirmed(result)` before using the result. A
+plain function goes in as `{ execute: (args) => refundOrder(args.orderId) }`.
+
+What it won't catch:
+
+- An agent that says done without calling the tool.
+- A tool that throws, including a timeout where the write did land.
+- A slow write. It reads as not confirmed, so wait inside `verify`, and give your read a timeout,
+  because `verify` has none of its own.
+- A streaming tool, which has not finished when `execute` returns: the agent is told the result is
+  unknown. A generator is refused: when you wrap it if `execute` is one, and on the first call if
+  `execute` returns one.
+
+If `verify` itself throws, the agent is told the result is unknown.
 
 ## This package phones home. `@agentx-core/scan` never does.
 

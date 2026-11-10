@@ -1,10 +1,14 @@
 {
   "name": "@agentx-core/security-sdk",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "See what your TypeScript AI agent actually did, and with an AgentX key, block it. Wrap a tool in one line; every call is recorded locally (tool name, argument names, never values) and `audit` prints the report. agentxProtect asks your AgentX gateway before each call.",
   "license": "MIT",
   "author": "AgentX <founders@agentx-core.com> (https://agentx-core.com)",
   "homepage": "https://agentx-core.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vdalal/agentx-security-sdk-ts.git"
+  },
   "bugs": {
     "email": "founders@agentx-core.com"
   },

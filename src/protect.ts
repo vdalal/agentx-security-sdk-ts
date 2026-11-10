@@ -1,6 +1,7 @@
 /**
  * `agentxProtect(tool)`: with an AgentX key, the gateway decides each call before it runs.
- * Without a key it records the call and runs it, exactly as `agentxWatch` does.
+ * Without a key it records the call and runs it, exactly as `agentxWatch` does, plus the tool's
+ * `verify` if it has one.
  *
  * WITH A KEY THIS IS THE PYTHON `@agentx_protect` EXPERIENCE, ported line by line from
  * `agentx_sdk/decorators.py` (founder 2026-10-17: "when they interface with the gateway with a
@@ -22,11 +23,12 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
-  buildPayload, cleanVerdict, expireHold, flattenQuery, stripControl, gatewayAnswered, getStatus, hitlTimeoutSeconds, maxCognitiveTurns,
+  buildPayload, callEnvironment, cleanVerdict, expireHold, flattenQuery, stripControl, gatewayAnswered, getStatus, hitlTimeoutSeconds, maxCognitiveTurns,
   noVerdictWords, postEvaluate, resolveApiKey, resolveFailMode, resolveGatewayUrl, resolvePosture,
   sanitizeDetail, warnOnce, watchSource, HITL_POLL_INTERVAL_S, type GatewayConfig, type Posture,
 } from "./gateway";
-import { noteBlock, noteGateway, noteHold, noteWrapped, recordCall, type WatchableTool, type WatchOptions } from "./wrap";
+import { noteBlock, noteGateway, noteHold, noteWrapped, recordCall, refusePlainFunction, warnIfNotWrapped, type WatchableTool, type WatchOptions } from "./wrap";
+import { appendUnconfirmed } from "./ledger";
 import { AUDIT_COMMAND, HOLDS_COMMAND } from "./report";
 import { honouredTargets, pyList, scrubResult, unhonouredTargets } from "./scrub";
 
@@ -45,6 +47,16 @@ export interface ProtectOptions extends WatchOptions {
    * Beats AGENTX_BUDGET_POOL_ID. Unset: no pooling.
    */
   budgetPoolId?: string;
+  /**
+   * Reads the change back after the tool has run: `verify(args, result)`, and exactly `true` means
+   * confirmed. Anything else tells the agent the change is not confirmed, an error in `verify`
+   * tells it the result is unknown, and both tell it not to report the call as done and not to
+   * repeat it. The tool's own result is withheld, a line is printed, and the audit screen counts
+   * it. Runs in this process with your credentials, needs no key, and acts while watching too,
+   * because you asked for it on this tool and the call has already run. It does not run when the
+   * call was stopped or when the tool threw.
+   */
+  verify?: (args: any, result: any) => unknown;
 }
 
 /** Thrown when the gateway (or, offline, this process) stops an agent repeating a refused call. Python `AgentXCircuitBreakerTripped`. */
@@ -67,6 +79,25 @@ export function formatBlock(policy: string, receiptId: string, challenge: string
 /** Whether a protected tool's result is an AgentX block rather than the tool's own answer (Python `is_block`). */
 export function isBlock(result: unknown): boolean {
   return typeof result === "string" && result.startsWith(BLOCK_PREFIX);
+}
+
+// NEVER "FAILED", AND NEVER "NOT EXECUTED". The call ran. An agent told it failed retries, and if
+// the write did land, or is only slow, that retry is the double refund. So both messages say the
+// same two things: do not report it as done, and do not repeat it. The tool's own result is left
+// out of both, because its "success" is the word the model would repeat.
+const UNCONFIRMED_PREFIX = "⚠️ [AgentX Unconfirmed]";
+
+/** The sentence the model reads, character for character Python's `_unconfirmed_message`. */
+export function unconfirmedMessage(tool: string, reason: "not_confirmed" | "could_not_check"): string {
+  if (reason === "could_not_check") {
+    return `${UNCONFIRMED_PREFIX} '${tool}' ran, but the read-back itself failed, so the result is unknown. Do not report this as done, and do not repeat the call. Tell the user it is unconfirmed.`;
+  }
+  return `${UNCONFIRMED_PREFIX} '${tool}' ran, but reading it back did not show the change. Do not report this as done. Do not repeat the call until you have checked the current state. Tell the user it is unconfirmed.`;
+}
+
+/** True if a protected tool ran and its `verify` did not confirm the change. Never true of a block: nothing was stopped. */
+export function isUnconfirmed(result: unknown): boolean {
+  return typeof result === "string" && result.startsWith(UNCONFIRMED_PREFIX);
 }
 
 /** The parts of a block, for the caller's code (Python's `AgentXBlock` attributes). */
@@ -599,6 +630,7 @@ async function decide(c: CallContext): Promise<unknown> {
     sessionCostUsd: spend.reportedCostUsd,
     budgetPoolId: c.opts.budgetPoolId || (process.env.AGENTX_BUDGET_POOL_ID ?? "").trim() || undefined,
     watchSource: watchSource(c.opts.posture, c.posture),
+    environment: callEnvironment(),
   });
   const outcome = await postEvaluate(c.cfg, payload);
   noteGateway({ answered: gatewayAnswered(outcome), reasoning: outcome.kind === "verdict" ? outcome.reasoning : null, posture: c.posture });
@@ -669,7 +701,8 @@ async function decide(c: CallContext): Promise<unknown> {
     const asked: unknown[] = Array.isArray(body.pii_targets_to_scrub) ? body.pii_targets_to_scrub : [];
     if (!asked.length) return runAllowed(c);
     if (c.posture === "audit") {
-      // Watching never changes a result, so a scrub becomes a record of what would have been
+      // Watching never changes a result (the tool's own `verify` is the developer's, and the one
+      // exception), so a scrub becomes a record of what would have been
       // removed, as Python's audit release files it.
       record(c, "WOULD_BLOCK", "Local DLP (PII scrub)");
       out(`🔍 [AgentX SDK] Would have scrubbed ${pyList(asked.map((t) => stripControl(String(t))))} from '${c.name}' output:`);
@@ -706,13 +739,67 @@ async function decide(c: CallContext): Promise<unknown> {
 }
 
 /**
+ * Run `verify` on what the tool returned. Hands back the tool's result when it is confirmed, and
+ * otherwise the message for the model, having told the person and written the row. An error's text
+ * can quote the developer's own code, so it is printed and reaches neither the model nor the ledger.
+ */
+async function readBack(name: string, opts: ProtectOptions, args: unknown, result: unknown): Promise<unknown> {
+  const notConfirmed = (reason: "not_confirmed" | "could_not_check", why?: string): string => {
+    if (reason === "could_not_check") {
+      err(`⚠️  [AgentX SDK] '${name}' ran, but its verify check could not run: ${why}. The caller was told the result is unknown.`);
+    } else {
+      // "The caller", not "the agent": as often, the code itself calls the tool.
+      err(`⚠️  [AgentX SDK] '${name}' ran, but reading it back did not show the change${why ? ` (${why})` : ""}. The caller was told it is not confirmed.`);
+    }
+    try {
+      appendUnconfirmed({ k: "unconfirmed", ts: Date.now(), tool: name, agent: opts.agentId ?? "", reason });
+    } catch {
+      /* a ledger problem is never a tool problem */
+    }
+    return unconfirmedMessage(name, reason);
+  };
+  // A generator handed back has not started, or only the caller knows: "ran" may be false, and
+  // dropping it would drop the work. Python's words, on the first call.
+  if (/^\[object (Async)?Generator\]$/.test(Object.prototype.toString.call(result))) {
+    throw new TypeError(`verify on '${name}' cannot work: it returned a generator, so verify cannot tell whether the work is done. Have the tool finish its work and return the result.`);
+  }
+  // A streaming tool's `execute` hands back an iterable with the work still to do, so a read-back
+  // now would come before the write.
+  if (result && typeof (result as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === "function") {
+    return notConfirmed("could_not_check", "the tool streams its result, so nothing has finished when it returns");
+  }
+  let answer: unknown;
+  try {
+    answer = await (opts.verify as NonNullable<ProtectOptions["verify"]>)(args, result);
+  } catch (e) {
+    const text = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    return notConfirmed("could_not_check", sanitizeDetail(text) || "an error");
+  }
+  // Only exactly true confirms. A forgotten `return` is undefined, and a record returned instead
+  // of a comparison is truthy either way, so neither may read as confirmed.
+  if (answer === true) return result;
+  if (answer === false) return notConfirmed("not_confirmed");
+  return notConfirmed("not_confirmed", `verify returned ${answer === null ? "null" : typeof answer}, not true or false`);
+}
+
+/**
  * Wrap one tool. Returns a new object with the same shape; the original is not mutated. A
  * Vercel AI SDK `tool()` carries no name, so pass `name`, or use `agentxProtectAll`.
  */
 export function agentxProtect<T extends WatchableTool>(tool: T, opts: ProtectOptions = {}): T {
+  refusePlainFunction(tool, "agentxProtect", opts.name);
+  warnIfNotWrapped(tool, "agentxProtect", opts.name);
+  if (opts.verify !== undefined && typeof opts.verify !== "function") {
+    throw new TypeError(`verify must be a function taking (args, result), or the check would never run. Got ${typeof opts.verify}.`);
+  }
   if (!tool || typeof tool.execute !== "function") return tool;
   const original = tool.execute;
   const name = opts.name ?? (typeof tool.name === "string" && tool.name ? tool.name : "(unnamed)");
+  // Calling a generator runs none of its body, so the read-back would come first, and the message
+  // would say "ran" about work that never started. Python's words, refused at the same moment.
+  if (opts.verify !== undefined && /^(Async)?GeneratorFunction$/.test((original as { constructor?: { name?: string } }).constructor?.name ?? "")) {
+    throw new TypeError(`verify on '${name}' cannot work: it is a generator, so nothing has happened yet when the call returns.`);
+  }
   noteWrapped(name);
   const description = typeof tool.description === "string" ? tool.description : undefined;
   const execute = async function (this: unknown, ...callArgs: any[]) {
@@ -722,7 +809,11 @@ export function agentxProtect<T extends WatchableTool>(tool: T, opts: ProtectOpt
     // and the tool all see the call without it.
     const taken: { args: unknown; receiptId?: string } = key ? takeReceipt(callArgs[0]) : { args: callArgs[0] };
     const toolArgs = taken.receiptId ? [taken.args, ...callArgs.slice(1)] : callArgs;
-    const run: Run = async () => original.apply(self, toolArgs);
+    // Wrapped HERE, not in `runAllowed`: this is the one thing every path that runs the tool calls,
+    // and watching, no key and an unanswered gateway all run it without going through `runAllowed`.
+    const run: Run = opts.verify
+      ? async () => readBack(name, opts, toolArgs[0], await original.apply(self, toolArgs))
+      : async () => original.apply(self, toolArgs);
     if (!key) {
       // No key: there is no gateway to ask. Record and run, as `agentxWatch` does.
       try {
@@ -768,7 +859,12 @@ export function agentxProtect<T extends WatchableTool>(tool: T, opts: ProtectOpt
 }
 
 /** Wrap a whole `tools` map, naming each by its key. `tools: agentxProtectAll({ runSql, sendEmail }, { agentId: "billing" })`. */
-export function agentxProtectAll<T extends Record<string, WatchableTool>>(tools: T, opts: Omit<ProtectOptions, "name"> = {}): T {
+export function agentxProtectAll<T extends Record<string, WatchableTool>>(tools: T, opts: Omit<ProtectOptions, "name" | "verify"> = {}): T {
+  // Refused and not ignored: one read-back cannot fit every tool, and silently dropping it would
+  // leave the developer believing their writes are checked.
+  if ((opts as ProtectOptions).verify !== undefined) {
+    throw new TypeError("verify is for one tool: pass it to agentxProtect on the tool it reads back, not to agentxProtectAll.");
+  }
   const out: Record<string, WatchableTool> = {};
   for (const [key, tool] of Object.entries(tools)) out[key] = agentxProtect(tool, { ...opts, name: key });
   return out as T;

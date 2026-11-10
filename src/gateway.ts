@@ -297,6 +297,29 @@ export interface EvaluateRequest {
   budgetPoolId?: string;
   /** What set watch (`watchSource`), sent only while watching. */
   watchSource?: string;
+  /** Where this deployment runs (`AGENTX_ENVIRONMENT`), already checked by `callEnvironment`. */
+  environment?: string;
+}
+
+/** `^[a-z0-9_-]{1,32}$`, as the gateway and the Python SDK check it. */
+const ENVIRONMENT_RE = /^[a-z0-9_-]{1,32}$/;
+const environmentSaid = new Set<string>();
+
+/**
+ * `AGENTX_ENVIRONMENT`, read at call time, when it is a short lower-case name; else undefined. A
+ * value that is set and is not such a name is dropped and said once: a team rule's number per
+ * environment then uses its lowest, a hold where the developer expected a run (Python
+ * `_call_environment`). From the process, never from the tool's arguments.
+ */
+export function callEnvironment(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const raw = env.AGENTX_ENVIRONMENT ?? "";
+  if (!raw) return undefined;
+  if (ENVIRONMENT_RE.test(raw)) return raw;
+  if (!environmentSaid.has(raw)) {
+    environmentSaid.add(raw);
+    console.error(`⚠️  [AgentX] AGENTX_ENVIRONMENT=${JSON.stringify(raw.slice(0, 40))} is not sent: use a short lower-case name such as prod or dev. A team rule with a number per environment uses its lowest until then.`);
+  }
+  return undefined;
 }
 
 /** The body of `POST /v1/evaluate`, field for field the Python client's (`client.py` evaluate_intent). */
@@ -316,6 +339,8 @@ export function buildPayload(req: EvaluateRequest): Record<string, unknown> {
   if (req.sessionTokens) payload.session_tokens = Math.trunc(req.sessionTokens);
   if (req.sessionCostUsd) payload.session_cost_usd = req.sessionCostUsd;
   if (req.budgetPoolId) payload.budget_pool_id = String(req.budgetPoolId);
+  // A team rule's number may differ per environment. Sent only when set.
+  if (req.environment) payload.environment = req.environment;
   if (req.posture === "audit") {
     payload.enforcement = "audit";
     // This client releases every verdict while watching, holds included, so the gateway need

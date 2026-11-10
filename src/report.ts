@@ -304,6 +304,7 @@ export function renderTools(read: LedgerRead, opts: ViewOptions = {}, novelty: r
   out.push(`  ${plural(read.rows.length, "call")} across ${plural(tools.length, "tool")}${sincePhrase(read.windowStart)}${zonePhrase()}`);
   out.push(...rosterLine(read));
   out.push(...gatewayLines(read));
+  out.push(...unconfirmedLines(read));
   if (shown.length < tools.length) {
     out.push(`  (showing the busiest ${shown.length}; ${tools.length - shown.length} more not listed: use --all)`);
   }
@@ -370,6 +371,38 @@ export function gatewayLines(read: LedgerRead, indent = "  "): string[] {
   if (stopped.length) lines.push(`${indent}Rules that stopped calls: ${fitNames(stopped, 75 - indent.length - 26)}`);
   const would = policies("WOULD_BLOCK");
   if (would.length) lines.push(`${indent}Flagged while watching (they ran): ${fitNames(would, 75 - indent.length - "Flagged while watching (they ran): ".length)}`);
+  return lines;
+}
+
+/**
+ * Calls that ran and whose `verify` did not confirm them, naming the tools: a bare count leaves the
+ * reader nowhere to go. Python's `agentx status` and `agentx audit` line. "On this ledger" because the
+ * count has no window of its own: without those words it reads as something that just happened.
+ */
+export function unconfirmedLines(read: LedgerRead, indent = "  "): string[] {
+  const total = read.unconfirmed.length;
+  if (!total) return [];
+  const byTool = new Map<string, number>();
+  for (const r of read.unconfirmed) byTool.set(r.tool, (byTool.get(r.tool) ?? 0) + 1);
+  const names = [...byTool.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([t, n]) => `${t} (${n})`);
+  // Every tool, wrapped at the screen's width: "book_appointment (1) +3 more" says where to look for
+  // one of four. A line breaks between tools and never inside one, so a tool keeps its count.
+  const units = [
+    ...`On this ledger, ${plural(total, "call")} ran and ${total === 1 ? "was" : "were"} not confirmed:`.split(" "),
+    ...names.map((n, i) => (i === names.length - 1 ? `${n}.` : `${n},`)),
+    ...`Reading ${total === 1 ? "it" : "them"} back did not show the change, or the check itself could not run.`.split(" "),
+  ];
+  const lines: string[] = [];
+  let line = "";
+  for (const unit of units) {
+    if (line && indent.length + line.length + 1 + unit.length > 75) {
+      lines.push(indent + line);
+      line = unit;
+    } else {
+      line = line ? `${line} ${unit}` : unit;
+    }
+  }
+  lines.push(indent + line);
   return lines;
 }
 

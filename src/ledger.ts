@@ -63,7 +63,21 @@ export interface RosterRow {
   tools: string[];
 }
 
-type Row = CallRow | TrimRow | RosterRow;
+/**
+ * A call that ran and whose `verify` did not confirm the change. Its own kind and not a call's
+ * status: the call already has its row, and a second call row would count it twice. A reader that
+ * knows nothing of this kind skips it.
+ */
+export interface UnconfirmedRow {
+  k: "unconfirmed";
+  ts: number;
+  tool: string;
+  agent: string;
+  /** "not_confirmed" (the read-back did not show the change) or "could_not_check" (it failed). */
+  reason: string;
+}
+
+type Row = CallRow | TrimRow | RosterRow | UnconfirmedRow;
 
 /** Where the ledger lives. `AGENTX_TS_LEDGER_PATH` moves it (tests, and a shared folder). */
 export function ledgerPath(env: NodeJS.ProcessEnv = process.env): string {
@@ -75,6 +89,11 @@ export function appendCall(row: CallRow, file: string = ledgerPath()): { created
   const created = !fs.existsSync(file);
   fs.appendFileSync(file, JSON.stringify(row) + "\n", "utf8");
   return { created };
+}
+
+/** Append one unconfirmed call. Throws what the write throws; the caller swallows it. */
+export function appendUnconfirmed(row: UnconfirmedRow, file: string = ledgerPath()): void {
+  fs.appendFileSync(file, JSON.stringify(row) + "\n", "utf8");
 }
 
 /** Write this run's roster. Never creates the file: a roster with no calls is not a record of a run. */
@@ -98,6 +117,8 @@ export interface LedgerRead {
   dropped: number;
   /** Every tool the most recent run WRAPPED, called or not. Empty on a ledger with no roster row. */
   roster: string[];
+  /** Calls that ran and whose `verify` did not confirm them, oldest first. Never counted in `rows`. */
+  unconfirmed: UnconfirmedRow[];
   coversAll: boolean;
   /** Epoch ms of the oldest kept row, or null. */
   windowStart: number | null;
@@ -106,9 +127,10 @@ export interface LedgerRead {
   cleanEnd: boolean;
 }
 
-function parseLines(text: string): { rows: CallRow[]; dropped: number; rosters: RosterRow[] } {
+function parseLines(text: string): { rows: CallRow[]; dropped: number; rosters: RosterRow[]; unconfirmed: UnconfirmedRow[] } {
   const rows: CallRow[] = [];
   const rosters: RosterRow[] = [];
+  const unconfirmed: UnconfirmedRow[] = [];
   let dropped = 0;
   for (const line of text.split("\n")) {
     if (!line.trim()) continue;
@@ -123,6 +145,8 @@ function parseLines(text: string): { rows: CallRow[]; dropped: number; rosters: 
       dropped = Math.max(dropped, r.dropped);
     } else if (r && r.k === "roster" && Array.isArray(r.tools) && typeof r.ts === "number") {
       rosters.push({ k: "roster", ts: r.ts, session: String(r.session ?? ""), tools: r.tools.map(String) });
+    } else if (r && r.k === "unconfirmed" && typeof r.tool === "string" && typeof r.ts === "number") {
+      unconfirmed.push({ k: "unconfirmed", ts: r.ts, tool: r.tool, agent: typeof r.agent === "string" ? r.agent : "", reason: String(r.reason ?? "") });
     } else if (r && r.k === "call" && typeof r.tool === "string" && typeof r.ts === "number") {
       rows.push({
         k: "call",
@@ -139,7 +163,7 @@ function parseLines(text: string): { rows: CallRow[]; dropped: number; rosters: 
       });
     }
   }
-  return { rows, dropped, rosters };
+  return { rows, dropped, rosters, unconfirmed };
 }
 
 /**
@@ -159,7 +183,7 @@ export function latestRoster(rosters: readonly RosterRow[]): string[] {
 
 export function readLedger(file: string = ledgerPath()): LedgerRead {
   const base: LedgerRead = {
-    path: file, exists: false, readable: true, rows: [], dropped: 0, roster: [], coversAll: true,
+    path: file, exists: false, readable: true, rows: [], dropped: 0, roster: [], unconfirmed: [], coversAll: true,
     windowStart: null, bytes: 0, cleanEnd: true,
   };
   if (!fs.existsSync(file)) return base;
@@ -172,13 +196,14 @@ export function readLedger(file: string = ledgerPath()): LedgerRead {
     // statement about the developer's own data.
     return { ...base, readable: false };
   }
-  const { rows, dropped, rosters } = parseLines(buf.toString("utf8"));
+  const { rows, dropped, rosters, unconfirmed } = parseLines(buf.toString("utf8"));
   rows.sort((a, b) => a.ts - b.ts);
   return {
     ...base,
     rows,
     dropped,
     roster: latestRoster(rosters),
+    unconfirmed,
     coversAll: dropped === 0,
     windowStart: rows.length ? rows[0].ts : null,
     bytes: buf.length,
@@ -215,9 +240,13 @@ export function trimLedger(
     const carried: RosterRow[] = read.roster.length
       ? [{ k: "roster", ts: now, session: "carried", tools: read.roster }]
       : [];
+    // Carried for the same reason, or the screen's count would vanish the first time retention
+    // fires. Aged out by the same rule as the calls.
+    const keptUnconfirmed = read.unconfirmed.filter((r) => r.ts >= cutoff).slice(-maxRows);
     const lines = [
       JSON.stringify(trim),
       ...carried.map((r) => JSON.stringify(r)),
+      ...keptUnconfirmed.map((r) => JSON.stringify(r)),
       ...kept.map((r) => JSON.stringify(r)),
     ].join("\n") + "\n";
     fs.writeFileSync(tmp, lines, "utf8");
